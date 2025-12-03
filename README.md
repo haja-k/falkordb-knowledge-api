@@ -64,10 +64,6 @@ For production deployment, consider using orchestration tools like Kubernetes or
 
 Contributions are welcome! Please follow the standard Git workflow: fork, branch, commit, and create a merge request.
 
-## License
-
-This project is licensed under [Your License Here].
-
 ## Project Status
 
 Active development.
