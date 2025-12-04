@@ -41,6 +41,25 @@ Once the API is running, you can interact with it via HTTP requests. Refer to th
 Example:
 ```
 curl http://localhost:8000/api/graph/query
+
+### Graph RAG endpoint (/graphrag)
+
+This project now includes a GraphRAG-style endpoint `/graphrag` compatible with the request body used by the Neo4j implementation. The endpoint accepts a JSON POST with the following shape:
+
+```
+{
+   "question": "...",
+   "top_k": 10,
+   "hops": 1,
+   "labels": ["Stakeholder","Goal"],
+   "alpha_vec": 0.6,
+   "beta_kw": 0.4,
+   "use_mmr": true,
+   "use_cross_doc": true
+}
+```
+
+The endpoint returns a JSON payload containing `answer`, `facts`, `seeds`, `params` and `timings`. Use the included `test_graphrag.py` script to exercise the endpoint quickly.
 ```
 
 ## Performance Testing
