@@ -1,14 +1,8 @@
-"""Helper functions for GraphRAG endpoint
-
-This module contains lightweight implementations of the helper functions
-used by the /graphrag endpoint (anchor / keywords extraction, embedding
-caller wrapper, vector + keyword searches, hybrid merging, neighbor
-expansion and output formatting).
+"""Moved graphrag helper functions into package location.
 """
 from typing import List, Optional, Any, Tuple, Dict
 import re
 import httpx
-from time import perf_counter
 
 _ANCHOR_RE = re.compile(r'"([^\"]+)"|“([^”]+)”|‘([^’]+)’|\'([^\']+)\'')
 
@@ -20,7 +14,6 @@ def anchor_terms(question: str, max_terms: int = 3) -> List[str]:
         if val and val.lower() not in ("and", "or", "the"):
             anchors.append(val)
 
-    # Title-cased bigrams
     if len(anchors) < max_terms:
         words = re.findall(r"[A-Za-z][A-Za-z\-]+", question)
         for i in range(len(words) - 1):
@@ -32,7 +25,6 @@ def anchor_terms(question: str, max_terms: int = 3) -> List[str]:
                     if len(anchors) >= max_terms:
                         break
 
-    # fallback: longest words
     if not anchors:
         kws = re.findall(r"[A-Za-z0-9\-']+", question)
         kws = sorted(kws, key=len, reverse=True)

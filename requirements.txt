@@ -5,3 +5,4 @@ falkordb>=1.0.0
 pydantic>=2.10.0
 httpx==0.25.0
 pyyaml==6.0.1
+pytest>=8.2.0

@@ -44,7 +44,7 @@ class RagBody(BaseModel):
     beta_kw: float = 0.4
     use_mmr: bool = True
     use_cross_doc: bool = True
-from graphrag_utils import (
+from functions import (
     anchor_terms,
     extract_keywords,
     get_embedding,
