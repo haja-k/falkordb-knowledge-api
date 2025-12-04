@@ -31,7 +31,7 @@ GENERATION_API_KEY = os.getenv("GENERATION_API_KEY")
 ENV = os.getenv("ENV", "development")
 
 # Graph name from refer.py
-GRAPH_NAME = "unified_knowledge_graph"
+GRAPH_NAME = os.getenv("GRAPH_NAME")
 
 
 # GraphRAG request body (compatible with neo4j implementation)
@@ -91,9 +91,6 @@ async def db_summary():
             
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to retrieve database summary: {str(e)}")
-
-
-
 
 
 @app.post("/graphrag")
