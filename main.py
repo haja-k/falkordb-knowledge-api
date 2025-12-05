@@ -21,8 +21,8 @@ FALKORDB_PASSWORD = os.getenv("FALKORDB_PASSWORD")
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", 8000))
 
-EMBEDDING_MODEL_URL = os.getenv("EMBEDDING_MODEL_URL")
-GENERATION_MODEL_URL = os.getenv("GENERATION_MODEL_URL")
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE")
+LLM_API_BASE = os.getenv("LLM_API_BASE")
 
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 GENERATION_API_KEY = os.getenv("GENERATION_API_KEY")
@@ -31,7 +31,7 @@ GENERATION_API_KEY = os.getenv("GENERATION_API_KEY")
 ENV = os.getenv("ENV", "development")
 
 # Graph name from refer.py
-GRAPH_NAME = os.getenv("GRAPH_NAME")
+GRAPH_NAME = os.getenv("GRAPH_NAME", "iscs_knowledge_graph")
 
 
 # GraphRAG request body (compatible with neo4j implementation)
@@ -48,10 +48,12 @@ from functions import (
     anchor_terms,
     extract_keywords,
     get_embedding,
+    check_embedding,
     cosine,
     format_graph_facts,
     hybrid_candidates,
     expand_neighbors_by_name,
+    retrieve_from_graph,
 )
 
 @app.get("/db-summary")
@@ -105,19 +107,34 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):
 
         t0 = perf_counter()
         q0 = body.question.strip()
-
         db = FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT, password=FALKORDB_PASSWORD)
         graph = db.select_graph(GRAPH_NAME)
+        print(f"[graphrag] Received question: {q0} + graph: {graph}")
 
-        # 1) embeddings (optional)
-        qvec = await get_embedding(EMBEDDING_MODEL_URL, EMBEDDING_API_KEY, q0)
+        # 1) embeddings (optional) — check connectivity first
+        embedding_available = await check_embedding(EMBEDDING_API_BASE, EMBEDDING_API_KEY)
+        print(f"[graphrag] Embedding available: {embedding_available}")
+        qvec = None
+        if embedding_available:
+            qvec = await get_embedding(EMBEDDING_API_BASE, EMBEDDING_API_KEY, q0)
 
         # 2) hybrid candidates
         cands = hybrid_candidates(graph, q0, qvec=qvec, labels=body.labels, k_vec=max(12, body.top_k), k_kw=max(12, body.top_k), alpha_vec=body.alpha_vec, beta_kw=body.beta_kw)
-
+        
         if not cands:
-            msg = "There is no available data related to the user query."
-            return {
+            # 2a) If hybrid failed, try a refer-style graph-only retrieval
+            try:
+                graph_results = retrieve_from_graph(graph, q0, limit_per_word=max(3, body.top_k))
+                if graph_results and graph_results.get('entities'):
+                    # convert entities into the same shape hybrid_candidates would return
+                    cands = [( { 'name': e.get('name'), 'labels': [e.get('type')] if e.get('type') else [] }, 1.0) for e in graph_results.get('entities') ]
+            except Exception:
+                # best-effort fallback; ignore errors and continue to return empty result
+                pass
+
+            if not cands:
+                msg = "There is no available data related to the user query."
+                return {
                 "success": True,
                 "message": msg,
                 "answer": msg,
@@ -132,6 +149,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):
                     "use_mmr": body.use_mmr,
                     "use_cross_doc": body.use_cross_doc,
                     "used_llm": False,
+                    "embedding_available": bool(embedding_available),
                 },
                 "timings": {"total": perf_counter()-t0}
             }
@@ -149,8 +167,19 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):
         # expand neighbors
         expanded = expand_neighbors_by_name(graph, seed_names[:body.top_k], hops=max(1, min(body.hops, 3)))
 
-        # format facts
+        # format facts — prefer expanded neighbor facts when available
         facts = format_graph_facts(expanded.get('nodes', []), expanded.get('rels', []), include_source=True)
+
+        # If expansion yields nothing but we have seed names (from retrieve_from_graph
+        # or hybrid candidates) include the seed names into facts so the user gets
+        # a helpful response instead of an all-or-nothing "no results" message.
+        if (not expanded.get('nodes') and not expanded.get('rels')) and seed_names:
+            # build a simple facts string listing seed names and optionally any
+            # relationships returned by a graph-only retriever (if present)
+            facts_lines = ["Graph Facts:"]
+            for nm in seed_names[:body.top_k]:
+                facts_lines.append(f'- Seed: {nm}')
+            facts = "\n".join(facts_lines)
 
         if facts.strip().endswith("(no results)"):
             msg = "There is no available data related to the user query."
@@ -169,11 +198,34 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):
                     "use_mmr": body.use_mmr,
                     "use_cross_doc": body.use_cross_doc,
                     "used_llm": False,
+                    "embedding_available": bool(embedding_available),
                 },
                 "timings": {"total": perf_counter()-t0}
             }
 
-        seeds_meta = [{"labels": list(n.get('labels', [])) if isinstance(n.get('labels', []), list) else [], "name": n.get('name') or n.get('title'), "score": sc} for n, sc in cands]
+        # Build seeds metadata consistently — ensure 'name' is a readable string.
+        seeds_meta = []
+        for n, sc in cands:
+            # Normalize node to dict-like access where possible
+            if isinstance(n, dict):
+                labels = list(n.get('labels', [])) if isinstance(n.get('labels', []), list) else []
+                name = n.get('name') or n.get('title') or n.get('id') or None
+            else:
+                # Node might be a scalar (string or number) returned by some cypher queries
+                labels = []
+                name = str(n) if n is not None else None
+
+            # Final fallback for name to avoid empty/null names
+            if not name:
+                name = "<unknown>"
+
+            try:
+                score_val = float(sc)
+            except Exception:
+                # ensure score is numeric
+                score_val = 0.0
+
+            seeds_meta.append({"labels": labels, "name": name, "score": score_val})
 
         return {
             "success": True,
@@ -190,6 +242,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):
                 "use_mmr": body.use_mmr,
                 "use_cross_doc": body.use_cross_doc,
                 "used_llm": False,
+                "embedding_available": bool(embedding_available),
             },
             "timings": {"total": perf_counter()-t0}
         }

@@ -7,6 +7,7 @@ from functions import (
     format_graph_facts,
     hybrid_candidates,
     expand_neighbors_by_name,
+    check_embedding,
 )
 
 
@@ -78,3 +79,46 @@ def test_hybrid_candidates_and_expand():
     # test neighbors expansion
     expanded = expand_neighbors_by_name(g, ["NodeA"], hops=1)
     assert expanded["nodes"] and expanded["rels"]
+
+
+def test_check_embedding_success(monkeypatch):
+    class FakeResp:
+        def __init__(self):
+            self.status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    class FakeClient:
+        def __init__(self, timeout=10.0):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+        async def post(self, endpoint, json=None, headers=None):
+            return FakeResp()
+
+    monkeypatch.setattr('functions.graphrag_utils.httpx.AsyncClient', lambda timeout=10.0: FakeClient())
+
+    import asyncio
+    ok = asyncio.run(check_embedding('http://fake', 'key'))
+    assert ok is True
+
+
+def test_check_embedding_failure(monkeypatch):
+    class BadClient:
+        def __init__(self, timeout=10.0):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+        async def post(self, endpoint, json=None, headers=None):
+            raise RuntimeError('connection failed')
+
+    monkeypatch.setattr('functions.graphrag_utils.httpx.AsyncClient', lambda timeout=10.0: BadClient())
+    import asyncio
+    ok = asyncio.run(check_embedding('http://bad', 'key'))
+    assert ok is False
