@@ -2,6 +2,5 @@
 *.pyc
 __pycache__
 refer.py
-__init__.py
 .pytest_cache
 .vscode
