@@ -1,7 +1,7 @@
 import asyncio
 
 import main as app_main
-from main import RagBody
+from main import RagBody, app
 
 
 class FakeResult:
@@ -15,30 +15,30 @@ class FakeGraph:
 
     def query(self, q):
         # If searching for name/title contains 'keyword' return a node dict
-        if "toLower(n.name) CONTAINS" in q or "toLower(n.title) CONTAINS" in q:
+        if "toLower(toString(n.name)) CONTAINS" in q or "toLower(toString(n.title)) CONTAINS" in q:
             node = {"id": "k1", "name": "KeywordNode", "title": "KeywordNode", "labels": ["Entity"]}
             return FakeResult([[node]])
         # fallback: no results
         return FakeResult([])
 
 
-class FakeDB:
+class FakeState:
     def __init__(self, graph):
-        self._graph = graph
-
-    def select_graph(self, name):
-        return self._graph
+        self.graph = graph
 
 
 def test_graphrag_fallback():
-    # make FalkorDB return a fake db with a fake graph
+    # Create fake graph and state
     fake_graph = FakeGraph()
+    fake_state = FakeState(fake_graph)
 
-    # patch app_main.FalkorDB and app_main.check_embedding directly
-    orig_FalkorDB = getattr(app_main, "FalkorDB")
+    # Save original state and check_embedding
+    orig_state = getattr(app, "state", None)
     orig_check_embedding = getattr(app_main, "check_embedding")
+    
     try:
-        app_main.FalkorDB = lambda host, port, password=None: FakeDB(fake_graph)
+        # Mock app.state.graph
+        app.state = fake_state
 
         async def fake_check(endpoint, key):
             return False
@@ -52,9 +52,9 @@ def test_graphrag_fallback():
 
         assert resp.get("success") is True
         # When the endpoint successfully processes the request we expect a
-        # well-formed response with an 'answer' or 'facts' payload. Seeds may
-        # be empty depending on the graph content.
-        assert "answer" in resp or "facts" in resp
+        # well-formed response with an 'answer' payload.
+        assert "data" in resp and "answer" in resp.get("data", {})
     finally:
-        app_main.FalkorDB = orig_FalkorDB
+        if orig_state is not None:
+            app.state = orig_state
         app_main.check_embedding = orig_check_embedding

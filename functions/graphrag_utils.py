@@ -4,9 +4,39 @@ from typing import List, Optional, Any, Tuple, Dict
 import os
 import logging
 import re
+import math
 import httpx
 
-_ANCHOR_RE = re.compile(r'"([^\"]+)"|“([^”]+)”|‘([^’]+)’|\'([^\']+)\'')
+# Shared constants matching Neo4j configuration
+DEFAULT_LABELS = [
+    "Stakeholder", "Goal", "Challenge", "Outcome", "Policy", "Strategy", "Pillar", "Sector",
+    "Time_Period", "Infrastructure", "Technology", "Initiative", "Objective", "Target",
+    "Opportunity", "Vision", "Region", "Enabler", "Entity"
+]
+
+_ANCHOR_RE = re.compile(r'"([^"]+)"|"([^"]+)"|\u2018([^\u2019]+)\u2019|\'([^\']+)\'')
+
+
+def _node_to_dict(node) -> dict:
+    """Convert a FalkorDB Node object (or any node-like object) to a plain dict.
+    
+    FalkorDB returns Node objects with .properties and .labels attributes.
+    This helper normalizes them to dicts for consistent access.
+    """
+    if isinstance(node, dict):
+        return node
+    
+    # FalkorDB Node object
+    if hasattr(node, 'properties'):
+        d = dict(node.properties) if node.properties else {}
+        if hasattr(node, 'labels') and node.labels:
+            d['labels'] = list(node.labels)
+        if hasattr(node, 'id'):
+            d.setdefault('id', node.id)
+        return d
+    
+    # Fallback for scalar or unknown types
+    return {"id": str(node), "name": str(node)}
 
 
 def anchor_terms(question: str, max_terms: int = 3) -> List[str]:
@@ -107,6 +137,7 @@ async def check_embedding(endpoint: Optional[str], api_key: Optional[str]) -> bo
 
 
 def cosine(a: List[float], b: List[float]) -> float:
+    """Cosine similarity between two vectors."""
     num = 0.0
     da = 0.0
     db = 0.0
@@ -117,6 +148,23 @@ def cosine(a: List[float], b: List[float]) -> float:
     if da == 0.0 or db == 0.0:
         return 0.0
     return num / ((da ** 0.5) * (db ** 0.5))
+
+
+def _minmax_norm(values: List[float]) -> List[float]:
+    """Min-max normalization matching Neo4j implementation."""
+    if not values:
+        return values
+    lo = min(values)
+    hi = max(values)
+    if hi - lo < 1e-12:
+        return [0.5 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _node_embedding(node: dict) -> Optional[List[float]]:
+    """Return node embedding as a Python list (or None). Matches Neo4j."""
+    e = node.get("embedding")
+    return list(e) if e is not None else None
 
 
 def format_graph_facts(nodes: List[Dict[str, Any]], rels: List[Dict[str, Any]], include_source: bool = False, max_lines: Optional[int] = None, snippet_chars: Optional[int] = None) -> str:
@@ -141,7 +189,14 @@ def format_graph_facts(nodes: List[Dict[str, Any]], rels: List[Dict[str, Any]], 
 
 
 def _fulltext_search(graph, question: str, limit: int = 12, labels: Optional[List[str]] = None) -> List[Tuple[dict, float]]:
-    labels = labels or []
+    """
+    Keyword-based search approximating BM25 behavior.
+    Scoring heuristics:
+    - Anchor terms (quoted/title-cased) get higher weight
+    - Exact matches score higher than partial
+    - Multiple term matches boost score
+    """
+    labels = labels or DEFAULT_LABELS
     anchors = anchor_terms(question, max_terms=3)
     kws = extract_keywords(question, max_terms=8)
     terms = anchors + [k for k in kws if k not in anchors]
@@ -149,48 +204,80 @@ def _fulltext_search(graph, question: str, limit: int = 12, labels: Optional[Lis
     if not terms:
         return []
 
-    out = []
-    seen = set()
-    for t in terms:
-        pattern = t.lower()
-        # try matching against common text fields in nodes: name, title, text, content
+    # Track scores per node for multi-term boosting
+    scores: Dict[str, Dict[str, Any]] = {}
+    anchor_set = set(a.lower() for a in anchors)
+
+    for idx, t in enumerate(terms):
+        pattern = t.lower().replace("'", "\\'")
+        # Use toString() to safely handle non-string properties before toLower
         q = (
-            f"MATCH (n) WHERE toLower(n.name) CONTAINS '{pattern}' OR toLower(n.title) CONTAINS '{pattern}' "
-            f"OR toLower(n.text) CONTAINS '{pattern}' OR toLower(n.content) CONTAINS '{pattern}' RETURN n LIMIT {limit}"
+            f"MATCH (n) WHERE "
+            f"(n.name IS NOT NULL AND toLower(toString(n.name)) CONTAINS '{pattern}') OR "
+            f"(n.title IS NOT NULL AND toLower(toString(n.title)) CONTAINS '{pattern}') OR "
+            f"(n.text IS NOT NULL AND toLower(toString(n.text)) CONTAINS '{pattern}') OR "
+            f"(n.content IS NOT NULL AND toLower(toString(n.content)) CONTAINS '{pattern}') "
+            f"RETURN n LIMIT {limit * 2}"
         )
         try:
             res = graph.query(q)
             for row in (res.result_set or []):
-                node = row[0]
-                # handle cases where cypher returns scalar fields rather than full node
-                if not isinstance(node, dict):
-                    # attempt to synthesize node dict if we got a scalar name
-                    node = {"id": str(node), "name": str(node)}
+                node = _node_to_dict(row[0])
                 nid = node.get('id') or node.get('name') or str(node)
-                if nid in seen:
-                    continue
-                seen.add(nid)
-                score = len(t)
-                out.append((node, float(score)))
+                name_val = str(node.get('name') or '').lower()
+
+                if nid not in scores:
+                    scores[nid] = {"node": node, "score": 0.0, "match_count": 0}
+
+                # Scoring heuristics (approximating BM25 behavior)
+                term_score = 0.0
+                
+                # Base score: term length (longer = more specific)
+                term_score += len(t) / 10.0
+                
+                # Anchor bonus: anchor terms are more important
+                if t.lower() in anchor_set:
+                    term_score += 2.0
+                
+                # Position bonus: earlier terms in query are often more important
+                term_score += (len(terms) - idx) / len(terms)
+                
+                # Exact match bonus
+                if name_val == pattern:
+                    term_score += 3.0
+                elif name_val.startswith(pattern) or name_val.endswith(pattern):
+                    term_score += 1.5
+                
+                scores[nid]["score"] += term_score
+                scores[nid]["match_count"] += 1
         except Exception:
             continue
+
+    # Multi-term match bonus (nodes matching multiple terms score higher)
+    out = []
+    for entry in scores.values():
+        final_score = entry["score"]
+        if entry["match_count"] > 1:
+            final_score *= (1.0 + 0.2 * (entry["match_count"] - 1))  # 20% boost per extra match
+        out.append((entry["node"], float(final_score)))
 
     out.sort(key=lambda x: x[1], reverse=True)
     return out[:limit]
 
 
 def _vector_search(graph, qvec: List[float], top_k: int = 12) -> List[Tuple[dict, float]]:
+    """Vector similarity search using cosine similarity. Matches Neo4j vector_find_similar_nodes."""
     try:
-        res = graph.query("MATCH (n) WHERE exists(n.embedding) RETURN n LIMIT 500")
+        res = graph.query("MATCH (n) WHERE n.embedding IS NOT NULL RETURN n LIMIT 500")
         rows = res.result_set or []
         candidates = []
         for row in rows:
-            node = row[0]
+            node = _node_to_dict(row[0])
             emb = node.get('embedding')
             if not emb:
                 continue
             try:
-                sc = cosine(qvec, emb)
+                sc = cosine(qvec, list(emb))
             except Exception:
                 sc = 0.0
             candidates.append((node, float(sc)))
@@ -213,18 +300,21 @@ def retrieve_from_graph(graph, query: str, limit_per_word: int = 5) -> Dict[str,
     try:
         for word in query_words:
             try:
+                # Use toString() to safely handle non-string properties before toLower
                 cypher_query = (
-                    f"MATCH (n) WHERE toLower(n.name) CONTAINS '{word}' OR toLower(n.title) CONTAINS '{word}' "
-                    f"OR toLower(n.text) CONTAINS '{word}' OR toLower(n.content) CONTAINS '{word}' RETURN n LIMIT {limit_per_word}"
+                    f"MATCH (n) WHERE "
+                    f"(n.name IS NOT NULL AND toLower(toString(n.name)) CONTAINS '{word}') OR "
+                    f"(n.title IS NOT NULL AND toLower(toString(n.title)) CONTAINS '{word}') OR "
+                    f"(n.text IS NOT NULL AND toLower(toString(n.text)) CONTAINS '{word}') OR "
+                    f"(n.content IS NOT NULL AND toLower(toString(n.content)) CONTAINS '{word}') "
+                    f"RETURN n LIMIT {limit_per_word}"
                 )
                 res = graph.query(cypher_query)
             except Exception:
                 continue
 
             for row in (res.result_set or []):
-                node = row[0]
-                if not isinstance(node, dict):
-                    node = {"id": str(node), "name": str(node)}
+                node = _node_to_dict(row[0])
                 results.append({"name": node.get('name') or node.get('title') or str(node.get('id')), "type": (node.get('labels') or [None])[0] if isinstance(node.get('labels', []), list) else None})
 
         # deduplicate
@@ -257,7 +347,8 @@ def retrieve_from_graph(graph, query: str, limit_per_word: int = 5) -> Dict[str,
 
 
 def hybrid_candidates(graph, question: str, qvec: Optional[List[float]] = None, labels: Optional[List[str]] = None, k_vec: int = 12, k_kw: int = 12, alpha_vec: float = 0.6, beta_kw: float = 0.25) -> List[Tuple[dict, float]]:
-    labels = labels or []
+    """Hybrid retrieval: combine vector and fulltext scores. Matches Neo4j implementation."""
+    labels = labels or DEFAULT_LABELS
     vec_hits = _vector_search(graph, qvec, top_k=k_vec) if qvec else []
     kw_hits = _fulltext_search(graph, question, limit=k_kw, labels=labels)
 
@@ -274,25 +365,18 @@ def hybrid_candidates(graph, question: str, qvec: Optional[List[float]] = None, 
     if not raw:
         return []
 
-    vec_vals = [v["vec"] for v in raw.values()]
-    kw_vals = [v["kw"] for v in raw.values()]
-    def _minmax(vals):
-        if not vals:
-            return []
-        lo = min(vals); hi = max(vals)
-        if hi - lo < 1e-12:
-            return [0.5 for _ in vals]
-        return [(x-lo)/(hi-lo) for x in vals]
+    # Normalize per channel (matches Neo4j _minmax_norm)
+    vec_n = _minmax_norm([v["vec"] for v in raw.values()])
+    kw_n = _minmax_norm([v["kw"] for v in raw.values()])
 
-    vec_n = _minmax(vec_vals)
-    kw_n = _minmax(kw_vals)
+    # Blend vector + keyword (renormalize weights to sum to 1, matches Neo4j)
+    w_sum = max(1e-12, (alpha_vec + beta_kw))
+    w_vec = alpha_vec / w_sum
+    w_kw = beta_kw / w_sum
 
     out = []
     for entry, vn, kn in zip(raw.values(), vec_n, kw_n):
-        w_sum = max(1e-12, (alpha_vec + beta_kw))
-        w_vec = alpha_vec / w_sum
-        w_kw = beta_kw / w_sum
-        combined = w_vec*vn + w_kw*kn
+        combined = w_vec * vn + w_kw * kn
         out.append((entry["node"], float(combined)))
 
     out.sort(key=lambda x: x[1], reverse=True)
@@ -300,6 +384,7 @@ def hybrid_candidates(graph, question: str, qvec: Optional[List[float]] = None, 
 
 
 def expand_neighbors_by_name(graph, seed_names: List[str], hops: int = 1):
+    """Expand neighborhood around seeds. Matches Neo4j traverse_neighbors behavior."""
     nodes: List[Dict[str, Any]] = []
     rels: List[Dict[str, Any]] = []
     seen_nodes = {}
@@ -313,7 +398,7 @@ def expand_neighbors_by_name(graph, seed_names: List[str], hops: int = 1):
             q = f"MATCH (a {{name: '{safe}'}})-[r]-(b) RETURN a,r,b LIMIT 200"
             res = graph.query(q)
             for row in (res.result_set or []):
-                a, r, b = row[0], row[1], row[2]
+                a, r, b = _node_to_dict(row[0]), row[1], _node_to_dict(row[2])
                 aid = a.get('id') or a.get('name')
                 bid = b.get('id') or b.get('name')
                 if aid not in seen_nodes:
@@ -322,7 +407,7 @@ def expand_neighbors_by_name(graph, seed_names: List[str], hops: int = 1):
                     seen_nodes[bid] = b
                 rels.append({
                     'type': r.get('type') if isinstance(r, dict) else (r.type if hasattr(r,'type') else 'REL'),
-                    'props': r.get('props') if isinstance(r, dict) else {},
+                    'props': r.get('props') if isinstance(r, dict) else (dict(r.properties) if hasattr(r, 'properties') else {}),
                     'start': aid,
                     'end': bid
                 })
@@ -330,3 +415,121 @@ def expand_neighbors_by_name(graph, seed_names: List[str], hops: int = 1):
             continue
 
     return {"nodes": list(seen_nodes.values()), "rels": rels}
+
+
+# =========================
+# MMR diversification (matches Neo4j)
+# =========================
+def mmr_select(candidates: List[Tuple[dict, float]],
+               k: int,
+               lambda_mult: float = 0.7) -> List[Tuple[dict, float]]:
+    """
+    Maximal Marginal Relevance over candidate nodes.
+    Matches Neo4j implementation with lambda_mult=0.7.
+    Uses node embeddings for diversity; falls back to score-only if embeddings missing.
+    """
+    if not candidates or k <= 0:
+        return []
+
+    # Fetch embeddings
+    embs: List[Optional[List[float]]] = []
+    for n, _ in candidates:
+        embs.append(_node_embedding(n))
+
+    selected: List[int] = []
+    rest = list(range(len(candidates)))
+
+    # Seed: best score
+    best0 = max(rest, key=lambda i: candidates[i][1])
+    selected.append(best0)
+    rest.remove(best0)
+
+    def _max_sim_to_selected(j: int) -> float:
+        ej = embs[j]
+        if ej is None or not selected:
+            return 0.0
+        sims = []
+        for i in selected:
+            ei = embs[i]
+            if ei is None:
+                sims.append(0.0)
+            else:
+                sims.append(cosine(ej, ei))
+        return max(sims) if sims else 0.0
+
+    while len(selected) < min(k, len(candidates)) and rest:
+        best_j, best_val = None, -1e9
+        for j in rest:
+            relevance = candidates[j][1]
+            diversity_penalty = _max_sim_to_selected(j)
+            val = lambda_mult * relevance - (1 - lambda_mult) * diversity_penalty
+            if val > best_val:
+                best_val, best_j = val, j
+        if best_j is not None:
+            selected.append(best_j)
+            rest.remove(best_j)
+        else:
+            break
+
+    return [candidates[i] for i in selected]
+
+
+# =========================
+# Cross-document coverage (matches Neo4j)
+# =========================
+def _doc_title_for_node(graph, node: dict) -> Optional[str]:
+    """Get document title for a node via SOURCE or MENTIONS relationship."""
+    name = node.get('name')
+    if not name:
+        return None
+    safe = str(name).replace("'", "\\'")
+    try:
+        res = graph.query(f"""
+            MATCH (n {{name: '{safe}'}})
+            OPTIONAL MATCH (n)-[:SOURCE]->(d1:Document)
+            OPTIONAL MATCH (d2:Document)-[:MENTIONS]->(n)
+            RETURN coalesce(d1.title, d2.title, d1.name, d2.name) AS t
+            LIMIT 1
+        """)
+        if res.result_set and res.result_set[0]:
+            return res.result_set[0][0]
+    except Exception:
+        pass
+    return None
+
+
+def diversify_by_document(graph, cands: List[Tuple[dict, float]], k: int) -> List[Tuple[dict, float]]:
+    """
+    Prefer seeds from different documents (round-robin by doc title).
+    Matches Neo4j diversify_by_document implementation.
+    """
+    if not cands:
+        return []
+
+    buckets: Dict[str, List[Tuple[dict, float]]] = {}
+    for n, sc in cands:
+        t = _doc_title_for_node(graph, n) or "__NO_DOC__"
+        buckets.setdefault(t, []).append((n, sc))
+
+    # Sort buckets by best score inside
+    for b in buckets.values():
+        b.sort(key=lambda t: t[1], reverse=True)
+
+    order = sorted(buckets.keys(), key=lambda key: buckets[key][0][1], reverse=True)
+
+    picked: List[Tuple[dict, float]] = []
+    ptrs = {key: 0 for key in buckets.keys()}
+    while len(picked) < min(k, len(cands)):
+        progressed = False
+        for key in order:
+            i = ptrs[key]
+            if i < len(buckets[key]):
+                picked.append(buckets[key][i])
+                ptrs[key] += 1
+                progressed = True
+                if len(picked) >= k:
+                    break
+        if not progressed:
+            break
+
+    return picked
