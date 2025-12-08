@@ -191,6 +191,8 @@ def format_graph_facts(nodes: List[Dict[str, Any]], rels: List[Dict[str, Any]], 
 def _fulltext_search(graph, question: str, limit: int = 12, labels: Optional[List[str]] = None) -> List[Tuple[dict, float]]:
     """
     Keyword-based search approximating BM25 behavior.
+    FIXED: Only searches name/title (like Neo4j), not full document text!
+    
     Scoring heuristics:
     - Anchor terms (quoted/title-cased) get higher weight
     - Exact matches score higher than partial
@@ -208,15 +210,25 @@ def _fulltext_search(graph, question: str, limit: int = 12, labels: Optional[Lis
     scores: Dict[str, Dict[str, Any]] = {}
     anchor_set = set(a.lower() for a in anchors)
 
+    # CRITICAL FIX: Filter by labels to avoid document nodes
+    label_filter = ""
+    if labels:
+        # Build label filter: (n:Stakeholder OR n:Goal OR ...)
+        label_conditions = " OR ".join([f"n:{lbl}" for lbl in labels])
+        label_filter = f"AND ({label_conditions})"
+
     for idx, t in enumerate(terms):
         pattern = t.lower().replace("'", "\\'")
-        # Use toString() to safely handle non-string properties before toLower
+        
+        # FIXED: Only search name and title, NOT text/content!
+        # This prevents matching document chunks and full-text content
         q = (
             f"MATCH (n) WHERE "
-            f"(n.name IS NOT NULL AND toLower(toString(n.name)) CONTAINS '{pattern}') OR "
-            f"(n.title IS NOT NULL AND toLower(toString(n.title)) CONTAINS '{pattern}') OR "
-            f"(n.text IS NOT NULL AND toLower(toString(n.text)) CONTAINS '{pattern}') OR "
-            f"(n.content IS NOT NULL AND toLower(toString(n.content)) CONTAINS '{pattern}') "
+            f"("
+            f"  (n.name IS NOT NULL AND toLower(toString(n.name)) CONTAINS '{pattern}') OR "
+            f"  (n.title IS NOT NULL AND toLower(toString(n.title)) CONTAINS '{pattern}')"
+            f") "
+            f"{label_filter} "
             f"RETURN n LIMIT {limit * 2}"
         )
         try:
@@ -225,6 +237,7 @@ def _fulltext_search(graph, question: str, limit: int = 12, labels: Optional[Lis
                 node = _node_to_dict(row[0])
                 nid = node.get('id') or node.get('name') or str(node)
                 name_val = str(node.get('name') or '').lower()
+                title_val = str(node.get('title') or '').lower()
 
                 if nid not in scores:
                     scores[nid] = {"node": node, "score": 0.0, "match_count": 0}
@@ -242,10 +255,12 @@ def _fulltext_search(graph, question: str, limit: int = 12, labels: Optional[Lis
                 # Position bonus: earlier terms in query are often more important
                 term_score += (len(terms) - idx) / len(terms)
                 
-                # Exact match bonus
-                if name_val == pattern:
+                # Exact match bonus (check both name and title)
+                if name_val == pattern or title_val == pattern:
                     term_score += 3.0
                 elif name_val.startswith(pattern) or name_val.endswith(pattern):
+                    term_score += 1.5
+                elif title_val.startswith(pattern) or title_val.endswith(pattern):
                     term_score += 1.5
                 
                 scores[nid]["score"] += term_score
